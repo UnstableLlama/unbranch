@@ -139,6 +139,24 @@ def rewrite_readme(
 
 # ── Core Logic ───────────────────────────────────────────────────────────────
 
+def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 60):
+    """Poll until a branch exists on a HuggingFace repo (e.g. after duplicate_repo)."""
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        try:
+            refs = api.list_repo_refs(repo_id, repo_type="model")
+            branch_names = [b.name for b in refs.branches]
+            if branch in branch_names:
+                return
+        except Exception:
+            pass
+        print(f"    Waiting for branch {branch} to appear on {repo_id}...")
+        _time.sleep(2)
+    raise TimeoutError(
+        f"Branch {branch} did not appear on {repo_id} within {timeout}s"
+    )
+
 def push_branch_to_main(
     *,
     repo_id: str,
@@ -282,6 +300,9 @@ def main():
             repo_type="model",
         )
         time.sleep(0.5)
+
+        # Wait for the duplication to finish (branches may not be available immediately)
+        wait_for_branch(api, repo_id, branch)
 
         # Push the correct branch as main (same repo, LFS objects already there)
         push_branch_to_main(
