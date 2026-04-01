@@ -62,6 +62,21 @@ def run_git(args: list[str], cwd: str | None = None, env: dict | None = None):
 
 # ── README Rewriting ─────────────────────────────────────────────────────────
 
+def make_target_name(repo_name: str, bpw: float) -> str:
+    """Build the single-BPW repo name by inserting the BPW before the quant suffix.
+
+    Example: Qwen3.5-4B-exl3  +  4.00  →  Qwen3.5-4B-4.00bpw-exl3
+    """
+    # Known quantization suffixes (add more as needed)
+    for suffix in ("-exl3", "-exl2", "-gguf", "-gptq", "-awq"):
+        if repo_name.endswith(suffix):
+            base = repo_name[: -len(suffix)]
+            return f"{base}-{fmt_bpw(bpw)}bpw{suffix}"
+
+    # Fallback: append at end
+    return f"{repo_name}-{fmt_bpw(bpw)}bpw"
+
+
 def rewrite_readme(
     readme: str,
     author: str,
@@ -75,9 +90,9 @@ def rewrite_readme(
     for bpw in bpws:
         b = fmt_bpw(bpw)
         branch = f"{b}bpw"
-        target = f"{author}/{repo_name}-{branch}"
+        target = f"{author}/{make_target_name(repo_name, bpw)}"
 
-        # Table / inline links:  …/Author/Repo/tree/X.XXbpw  →  …/Author/Repo-X.XXbpw
+        # Table / inline links:  …/Author/Repo/tree/X.XXbpw  →  …/Author/Repo-X.XXbpw-exl3
         readme = readme.replace(
             f"{parent}/tree/{branch}",
             f"{target}",
@@ -85,7 +100,7 @@ def rewrite_readme(
 
         # CLI download with quoted revision:
         #   hf download Author/Repo --revision "X.XXbpw" --local-dir …
-        #   →  hf download Author/Repo-X.XXbpw --local-dir …
+        #   →  hf download Author/Repo-X.XXbpw-exl3 --local-dir …
         readme = readme.replace(
             f'{parent} --revision "{branch}"',
             f"{target}",
@@ -96,6 +111,18 @@ def rewrite_readme(
             f"{parent} --revision {branch}",
             f"{target}",
         )
+
+    # Also update --local-dir references to match new naming
+    # Old: --local-dir ./Repo-X.XXbpw  →  --local-dir ./NewRepoName
+    for bpw in bpws:
+        b = fmt_bpw(bpw)
+        old_dir = f"{repo_name}-{b}bpw"
+        new_dir = make_target_name(repo_name, bpw)
+        if old_dir != new_dir:
+            readme = readme.replace(
+                f"--local-dir ./{old_dir}",
+                f"--local-dir ./{new_dir}",
+            )
 
     return readme
 
@@ -190,7 +217,7 @@ def main():
     parent_repo = f"{args.author}/{args.repo_name}"
 
     def target_name(bpw):
-        return f"{args.repo_name}-{fmt_bpw(bpw)}bpw"
+        return make_target_name(args.repo_name, bpw)
 
     def target_id(bpw):
         return f"{args.author}/{target_name(bpw)}"
