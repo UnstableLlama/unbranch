@@ -54,38 +54,24 @@ export HF_TOKEN=hf_...
 python unbranch.py \
   --author UnstableLlama \
   --repo-name Qwen3.5-4B-exl3 \
-  --bpws 2.10 3.00 4.00 5.00 6.00
+  --bpws 2.10 3.00 4.00 5.00 6.00 \
+  # --private \
+  --dry-run
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--author` | *(required)* | HF username or org |
+| `--repo-name` | *(required)* | Source repo name (without author) |
+| `--bpws` | *(required)* | BPW values present as branches |
+| `--dry-run` | off | Preview actions without making changes |
+| `--private` | off | Create new repos as private |
+
+Remove `--dry-run` when you're ready to execute for real.
 
 ### Jupyter Notebook (recommended)
 
 Open `unbranch.ipynb` and fill in the config cell. Same workflow, interactive output. The notebook runs each step in its own cell so you can inspect results before proceeding, and defaults to `DRY_RUN = True`.
-
-### Private repos
-
-Create the new single-BPW repos as private (does not affect the renamed parent repo):
-
-```bash
-python unbranch.py \
-  --author UnstableLlama \
-  --repo-name Qwen3.5-4B-exl3 \
-  --bpws 2.10 3.00 4.00 5.00 6.00 \
-  --private
-```
-
-In the notebook, set `PRIVATE = True` in the config cell.
-
-### Dry run
-
-Preview what would happen without making any changes:
-
-```bash
-python unbranch.py \
-  --author UnstableLlama \
-  --repo-name Qwen3.5-4B-exl3 \
-  --bpws 2.10 3.00 4.00 5.00 6.00 \
-  --dry-run
-```
 
 ## Supported quant formats
 
