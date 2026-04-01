@@ -2,6 +2,8 @@
 
 Split a HuggingFace repo that stores quantized models on separate branches (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos.
 
+> **WARNING: This script performs destructive, irreversible operations.** It renames your parent repo, force-pushes branches to main, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
+
 ## Why
 
 HuggingFace repos that use branches for different quantization bitrates are harder to browse and download. This tool converts them into the cleaner single-repo-per-bitrate convention:
@@ -54,9 +56,23 @@ python unbranch.py \
   --bpws 2.10 3.00 4.00 5.00 6.00
 ```
 
-### Jupyter Notebook
+### Jupyter Notebook (recommended)
 
-Open `unbranch.ipynb` and fill in the config cell. Same workflow, interactive output.
+Open `unbranch.ipynb` and fill in the config cell. Same workflow, interactive output. The notebook runs each step in its own cell so you can inspect results before proceeding, and defaults to `DRY_RUN = True`.
+
+### Private repos
+
+Create the new single-BPW repos as private (does not affect the renamed parent repo):
+
+```bash
+python unbranch.py \
+  --author UnstableLlama \
+  --repo-name Qwen3.5-4B-exl3 \
+  --bpws 2.10 3.00 4.00 5.00 6.00 \
+  --private
+```
+
+In the notebook, set `PRIVATE = True` in the config cell.
 
 ### Dry run
 
