@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -261,6 +262,7 @@ def main():
         print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
         api.create_repo(repo_id, exist_ok=True, repo_type="model")
+        time.sleep(0.5)
 
         push_branch_as_main(
             source_repo=parent_repo,
@@ -270,6 +272,7 @@ def main():
             token=token,
         )
         print(f"  ✓ {repo_id}")
+        time.sleep(0.5)
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
@@ -289,10 +292,13 @@ def main():
         token=token,
     )
 
+    time.sleep(0.5)
+
     # Rename the repo
     print(f"\n  Renaming {parent_repo} → {largest_repo}")
     api.move_repo(from_id=parent_repo, to_id=largest_repo, repo_type="model")
     print(f"  ✓ Renamed")
+    time.sleep(0.5)
 
     # ── 4. Verify ────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -332,6 +338,7 @@ def main():
         try:
             api.delete_branch(largest_repo, branch, repo_type="model")
             print(f"  Deleted: {branch}")
+            time.sleep(0.5)
         except Exception as e:
             print(f"  Could not delete {branch}: {e}")
 
