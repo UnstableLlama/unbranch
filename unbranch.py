@@ -260,6 +260,10 @@ def main():
     api = HfApi(token=token)
 
     bpws = sorted(args.bpws)
+    if len(bpws) < 2:
+        print("Error: Need at least 2 BPW values (one becomes the renamed parent).")
+        sys.exit(1)
+
     largest_bpw = bpws[-1]
     smaller_bpws = bpws[:-1]
 
@@ -292,61 +296,58 @@ def main():
             if "huggingface.co" in line or "hf download" in line:
                 print(f"    + {line.strip()[:120]}")
 
-    if args.dry_run:
-        print(f"\n[DRY RUN] Would create these repos:")
-        for bpw in smaller_bpws:
-            print(f"  NEW  {target_id(bpw)}  ← branch {fmt_bpw(bpw)}bpw")
-        print(f"  RENAME {parent_repo} → {target_id(largest_bpw)}  ← branch {fmt_bpw(largest_bpw)}bpw → main")
-        return
+    largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
+    largest_repo = target_id(largest_bpw)
 
     # ── 2. Create repos for smaller BPWs ─────────────────────────────────
     print(f"\n{'=' * 60}")
     print(f"Step 2: Create repos for smaller BPWs")
     print(f"{'=' * 60}")
 
-    for bpw in smaller_bpws:
-        branch = f"{fmt_bpw(bpw)}bpw"
-        repo_id = target_id(bpw)
-        print(f"\n  ── {repo_id} (from branch {branch}) ──")
+    if args.dry_run:
+        for bpw in smaller_bpws:
+            print(f"  [DRY RUN] Would create {target_id(bpw)} ← branch {fmt_bpw(bpw)}bpw")
+    else:
+        for bpw in smaller_bpws:
+            branch = f"{fmt_bpw(bpw)}bpw"
+            repo_id = target_id(bpw)
+            print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
-        api.create_repo(repo_id, exist_ok=True, repo_type="model", private=args.private)
-        time.sleep(0.5)
+            api.create_repo(repo_id, exist_ok=True, repo_type="model", private=args.private)
+            time.sleep(0.5)
 
-        # Transfer just this branch's files (streams LFS through local machine)
-        transfer_branch_to_new_repo(
-            source_repo=parent_repo,
-            branch=branch,
-            target_repo=repo_id,
-            readme_text=readme_text,
-            token=token,
-        )
-        print(f"  ✓ {repo_id}")
-        time.sleep(0.5)
+            transfer_branch_to_new_repo(
+                source_repo=parent_repo,
+                branch=branch,
+                target_repo=repo_id,
+                readme_text=readme_text,
+                token=token,
+            )
+            print(f"  ✓ {repo_id}")
+            time.sleep(0.5)
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
     print(f"Step 3: Convert parent repo to largest BPW ({fmt_bpw(largest_bpw)})")
     print(f"{'=' * 60}\n")
 
-    largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
-    largest_repo = target_id(largest_bpw)
+    if args.dry_run:
+        print(f"  [DRY RUN] Would push {largest_branch} → main on {parent_repo}")
+        print(f"  [DRY RUN] Would rename {parent_repo} → {largest_repo}")
+    else:
+        print(f"  Pushing {largest_branch} → main on {parent_repo}")
+        push_branch_to_main(
+            repo_id=parent_repo,
+            branch=largest_branch,
+            readme_text=readme_text,
+            token=token,
+        )
+        time.sleep(0.5)
 
-    # Push the largest branch as main (same repo, LFS objects already there)
-    print(f"  Pushing {largest_branch} → main on {parent_repo}")
-    push_branch_to_main(
-        repo_id=parent_repo,
-        branch=largest_branch,
-        readme_text=readme_text,
-        token=token,
-    )
-
-    time.sleep(0.5)
-
-    # Rename the repo
-    print(f"\n  Renaming {parent_repo} → {largest_repo}")
-    api.move_repo(from_id=parent_repo, to_id=largest_repo, repo_type="model")
-    print(f"  ✓ Renamed")
-    time.sleep(0.5)
+        print(f"\n  Renaming {parent_repo} → {largest_repo}")
+        api.move_repo(from_id=parent_repo, to_id=largest_repo, repo_type="model")
+        print(f"  ✓ Renamed")
+        time.sleep(0.5)
 
     # ── 4. Verify ────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -354,45 +355,56 @@ def main():
     print(f"{'=' * 60}\n")
 
     all_ok = True
-    for bpw in bpws:
-        repo_id = target_id(bpw)
-        try:
-            files = api.list_repo_files(repo_id, repo_type="model")
-            count = len(files)
-            has_safetensors = any(f.endswith(".safetensors") for f in files)
-            status = "OK" if count >= 2 and has_safetensors else "⚠ CHECK"
-            print(f"  {repo_id}: {count} files [{status}]")
-            if count < 2 or not has_safetensors:
-                all_ok = False
-        except Exception as e:
-            print(f"  {repo_id}: ERROR — {e}")
-            all_ok = False
-
-    if not all_ok:
-        print("\n  ⚠ Some repos may have issues. Skipping branch cleanup.")
-        print("  Please verify manually, then delete branches with:")
+    if args.dry_run:
         for bpw in bpws:
-            branch = f"{fmt_bpw(bpw)}bpw"
-            print(f"    huggingface_hub.HfApi().delete_branch('{largest_repo}', '{branch}')")
-        sys.exit(1)
+            print(f"  [DRY RUN] Would verify {target_id(bpw)}")
+    else:
+        for bpw in bpws:
+            repo_id = target_id(bpw)
+            try:
+                files = api.list_repo_files(repo_id, repo_type="model")
+                count = len(files)
+                has_safetensors = any(f.endswith(".safetensors") for f in files)
+                status = "OK" if count >= 2 and has_safetensors else "⚠ CHECK"
+                print(f"  {repo_id}: {count} files [{status}]")
+                if count < 2 or not has_safetensors:
+                    all_ok = False
+            except Exception as e:
+                print(f"  {repo_id}: ERROR — {e}")
+                all_ok = False
+
+        if not all_ok:
+            print("\n  ⚠ Some repos may have issues. Skipping branch cleanup.")
+            print("  Please verify manually, then delete branches with:")
+            for bpw in bpws:
+                branch = f"{fmt_bpw(bpw)}bpw"
+                print(f"    huggingface_hub.HfApi().delete_branch('{largest_repo}', branch='{branch}')")
+            sys.exit(1)
 
     # ── 5. Delete old branches ───────────────────────────────────────────
     print(f"\n{'=' * 60}")
     print(f"Step 5: Delete old branches from {largest_repo}")
     print(f"{'=' * 60}\n")
 
-    for bpw in bpws:
-        branch = f"{fmt_bpw(bpw)}bpw"
-        try:
-            api.delete_branch(largest_repo, branch=branch, repo_type="model")
-            print(f"  Deleted: {branch}")
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"  Could not delete {branch}: {e}")
+    if args.dry_run:
+        for bpw in bpws:
+            print(f"  [DRY RUN] Would delete branch {fmt_bpw(bpw)}bpw")
+    else:
+        for bpw in bpws:
+            branch = f"{fmt_bpw(bpw)}bpw"
+            try:
+                api.delete_branch(largest_repo, branch=branch, repo_type="model")
+                print(f"  Deleted: {branch}")
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"  Could not delete {branch}: {e}")
 
     # ── Done ─────────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"Done! Created {len(bpws)} single-BPW repos:")
+    if args.dry_run:
+        print("Dry run complete. Remove --dry-run to execute for real.")
+    else:
+        print(f"Done! Created {len(bpws)} single-BPW repos:")
     for bpw in bpws:
         print(f"  https://huggingface.co/{target_id(bpw)}")
     print(f"{'=' * 60}\n")
