@@ -384,7 +384,7 @@ def main():
     for bpw in bpws:
         branch = f"{fmt_bpw(bpw)}bpw"
         try:
-            api.delete_branch(largest_repo, branch, repo_type="model")
+            api.delete_branch(largest_repo, branch=branch, repo_type="model")
             print(f"  Deleted: {branch}")
             time.sleep(0.5)
         except Exception as e:
