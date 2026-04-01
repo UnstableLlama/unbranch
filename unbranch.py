@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 unbranch.py — Split a HuggingFace repo with branched quantizations into
-separate single-BPW repos, entirely server-side (no large file downloads).
+separate single-BPW repos.
+
+WARNING: This script performs destructive, irreversible operations. It renames
+repos, force-pushes branches to main, and deletes branches. Always use
+--dry-run first to preview what will happen.
 
 Usage:
     export HF_TOKEN=hf_...
@@ -14,12 +18,15 @@ What it does:
     1. Downloads the README from the parent repo and rewrites branch links
        to point at the new single-BPW repos.
     2. For every BPW *except* the largest: creates a new repo, clones the
-       branch (LFS pointers only — no large files touch disk), writes the
-       updated README, and pushes as main.
+       branch, transfers LFS objects, and pushes as main.
     3. For the largest BPW: force-pushes that branch to the parent repo's
        main branch (with updated README), then renames the parent repo.
     4. Verifies every new repo has files.
     5. Deletes the old BPW branches from the (now-renamed) parent repo.
+
+    For cross-repo pushes, LFS objects are fetched from the source and pushed
+    to the target one branch at a time. For same-repo pushes (parent branch →
+    main), LFS objects already exist so no transfer is needed.
 
 Requires: huggingface_hub  (pip install huggingface_hub)
 """
@@ -138,7 +145,17 @@ def push_branch_as_main(
     readme_text: str,
     token: str,
 ):
-    """Clone a branch (LFS pointers only) and push it as main to target_repo."""
+    """Clone a branch and push it as main to target_repo.
+
+    For cross-repo pushes (source != target), LFS objects are fetched from
+    the source and pushed to the target. Only one branch worth of LFS data
+    is on disk at a time, and it's cleaned up with the temp directory.
+
+    For same-repo pushes (e.g. pushing a branch to main on the parent),
+    LFS objects already exist so no transfer is needed.
+    """
+    cross_repo = source_repo != target_repo
+    # Skip LFS checkout into working dir — we only need the objects in the cache
     lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
 
     def hf_url(repo_id):
@@ -154,6 +171,11 @@ def push_branch_as_main(
         # Ensure git identity is configured (temp repos may lack it)
         run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
         run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
+
+        # For cross-repo pushes, fetch LFS objects from the source into cache
+        if cross_repo:
+            print("  Fetching LFS objects from source...")
+            run_git(["git", "lfs", "fetch", "origin", "--all"], cwd=tmpdir)
 
         # Write the updated README
         readme_path = os.path.join(tmpdir, "README.md")
@@ -182,6 +204,12 @@ def push_branch_as_main(
             ["git", "remote", "set-url", "origin", hf_url(target_repo)],
             cwd=tmpdir,
         )
+
+        # For cross-repo pushes, upload LFS objects to the target first
+        if cross_repo:
+            print("  Pushing LFS objects to target...")
+            run_git(["git", "lfs", "push", "origin", "--all"], cwd=tmpdir)
+
         run_git(
             ["git", "push", "-u", "origin", "main", "--force"],
             cwd=tmpdir, env=lfs_env,
