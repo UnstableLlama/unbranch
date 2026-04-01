@@ -202,6 +202,10 @@ def main():
         "--dry-run", action="store_true",
         help="Show what would happen without making changes",
     )
+    parser.add_argument(
+        "--private", action="store_true",
+        help="Create new repos as private (does not affect the renamed parent repo)",
+    )
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN")
@@ -261,7 +265,7 @@ def main():
         repo_id = target_id(bpw)
         print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
-        api.create_repo(repo_id, exist_ok=True, repo_type="model")
+        api.create_repo(repo_id, exist_ok=True, repo_type="model", private=args.private)
         time.sleep(0.5)
 
         push_branch_as_main(
