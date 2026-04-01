@@ -2,7 +2,8 @@
 
 Split a HuggingFace repo that stores quantized models on separate branches (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos.
 
-> **WARNING: This script performs destructive, irreversible operations.** It renames your parent repo, force-pushes branches to main, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
+> [!CAUTION]
+> **This script performs destructive, irreversible operations.** It renames your parent repo, force-pushes branches to main, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
 
 ## Why
 
