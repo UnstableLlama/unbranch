@@ -17,16 +17,18 @@ Usage:
 What it does:
     1. Downloads the README from the parent repo and rewrites branch links
        to point at the new single-BPW repos.
-    2. For every BPW *except* the largest: creates a new repo, clones the
-       branch, transfers LFS objects, and pushes as main.
-    3. For the largest BPW: force-pushes that branch to the parent repo's
-       main branch (with updated README), then renames the parent repo.
+    2. For every BPW *except* the largest: duplicates the parent repo
+       (server-side, no downloads), then pushes the correct branch as main
+       and deletes the other branches.
+    3. For the largest BPW: pushes that branch as main on the parent repo,
+       then renames it.
     4. Verifies every new repo has files.
     5. Deletes the old BPW branches from the (now-renamed) parent repo.
 
-    For cross-repo pushes, LFS objects are fetched from the source and pushed
-    to the target one branch at a time. For same-repo pushes (parent branch →
-    main), LFS objects already exist so no transfer is needed.
+    No large files are downloaded. Repos are duplicated server-side via the
+    HuggingFace API, then only the README is pulled locally for editing.
+    Branch-to-main promotion is done via git with GIT_LFS_SKIP_SMUDGE=1
+    (only LFS pointers, since the LFS objects already exist in the repo).
 
 Requires: huggingface_hub  (pip install huggingface_hub)
 """
@@ -137,45 +139,34 @@ def rewrite_readme(
 
 # ── Core Logic ───────────────────────────────────────────────────────────────
 
-def push_branch_as_main(
+def push_branch_to_main(
     *,
-    source_repo: str,
+    repo_id: str,
     branch: str,
-    target_repo: str,
     readme_text: str,
     token: str,
 ):
-    """Clone a branch and push it as main to target_repo.
+    """Push a branch as main within the same repo (no large file downloads).
 
-    For cross-repo pushes (source != target), LFS objects are fetched from
-    the source and pushed to the target. Only one branch worth of LFS data
-    is on disk at a time, and it's cleaned up with the temp directory.
-
-    For same-repo pushes (e.g. pushing a branch to main on the parent),
-    LFS objects already exist so no transfer is needed.
+    Clones with GIT_LFS_SKIP_SMUDGE=1 so only LFS pointers touch disk.
+    Since the push target is the same repo, the LFS objects already exist
+    server-side and HuggingFace accepts the pointers.
     """
-    cross_repo = source_repo != target_repo
-    # Skip LFS checkout into working dir — we only need the objects in the cache
     lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
 
-    def hf_url(repo_id):
-        return f"https://user:{token}@huggingface.co/{repo_id}"
+    def hf_url(rid):
+        return f"https://user:{token}@huggingface.co/{rid}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         run_git(
             ["git", "clone", "--single-branch", "--branch", branch,
-             hf_url(source_repo), tmpdir],
+             hf_url(repo_id), tmpdir],
             env=lfs_env,
         )
 
         # Ensure git identity is configured (temp repos may lack it)
         run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
         run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
-
-        # For cross-repo pushes, fetch LFS objects from the source into cache
-        if cross_repo:
-            print("  Fetching LFS objects from source...")
-            run_git(["git", "lfs", "fetch", "origin", "--all"], cwd=tmpdir)
 
         # Write the updated README
         readme_path = os.path.join(tmpdir, "README.md")
@@ -196,20 +187,8 @@ def push_branch_as_main(
                 cwd=tmpdir,
             )
 
-        # Rename current branch to main
+        # Rename current branch to main and force-push
         run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
-
-        # Point remote at the target and push
-        run_git(
-            ["git", "remote", "set-url", "origin", hf_url(target_repo)],
-            cwd=tmpdir,
-        )
-
-        # For cross-repo pushes, upload LFS objects to the target first
-        if cross_repo:
-            print("  Pushing LFS objects to target...")
-            run_git(["git", "lfs", "push", "origin", "--all"], cwd=tmpdir)
-
         run_git(
             ["git", "push", "-u", "origin", "main", "--force"],
             cwd=tmpdir, env=lfs_env,
@@ -285,7 +264,7 @@ def main():
 
     # ── 2. Create repos for smaller BPWs ─────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"Step 2: Create repos for smaller BPWs")
+    print(f"Step 2: Duplicate & configure repos for smaller BPWs")
     print(f"{'=' * 60}")
 
     for bpw in smaller_bpws:
@@ -293,18 +272,36 @@ def main():
         repo_id = target_id(bpw)
         print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
-        api.create_repo(repo_id, exist_ok=True, repo_type="model", private=args.private)
+        # Duplicate the parent repo server-side (includes all branches + LFS)
+        print(f"  Duplicating {parent_repo} → {repo_id}")
+        api.duplicate_repo(
+            from_id=parent_repo,
+            to_id=repo_id,
+            private=args.private,
+            exist_ok=True,
+            repo_type="model",
+        )
         time.sleep(0.5)
 
-        push_branch_as_main(
-            source_repo=parent_repo,
+        # Push the correct branch as main (same repo, LFS objects already there)
+        push_branch_to_main(
+            repo_id=repo_id,
             branch=branch,
-            target_repo=repo_id,
             readme_text=readme_text,
             token=token,
         )
-        print(f"  ✓ {repo_id}")
         time.sleep(0.5)
+
+        # Delete all the other BPW branches from the duplicate
+        for other_bpw in bpws:
+            other_branch = f"{fmt_bpw(other_bpw)}bpw"
+            try:
+                api.delete_branch(repo_id, other_branch, repo_type="model")
+                time.sleep(0.5)
+            except Exception:
+                pass  # Branch may not exist or already deleted
+
+        print(f"  ✓ {repo_id}")
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
@@ -314,12 +311,11 @@ def main():
     largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
     largest_repo = target_id(largest_bpw)
 
-    # Push the largest branch as main (still using the old repo name)
+    # Push the largest branch as main (same repo, LFS objects already there)
     print(f"  Pushing {largest_branch} → main on {parent_repo}")
-    push_branch_as_main(
-        source_repo=parent_repo,
+    push_branch_to_main(
+        repo_id=parent_repo,
         branch=largest_branch,
-        target_repo=parent_repo,
         readme_text=readme_text,
         token=token,
     )
