@@ -17,18 +17,13 @@ Usage:
 What it does:
     1. Downloads the README from the parent repo and rewrites branch links
        to point at the new single-BPW repos.
-    2. For every BPW *except* the largest: duplicates the parent repo
-       (server-side, no downloads), then pushes the correct branch as main
-       and deletes the other branches.
-    3. For the largest BPW: pushes that branch as main on the parent repo,
-       then renames it.
+    2. For every BPW *except* the largest: creates a new empty repo, then
+       transfers just that one branch's files via git LFS (streamed through
+       your machine one branch at a time, cleaned up after each).
+    3. For the largest BPW: pushes that branch as main on the parent repo
+       (LFS pointers only, no download), then renames it.
     4. Verifies every new repo has files.
     5. Deletes the old BPW branches from the (now-renamed) parent repo.
-
-    No large files are downloaded. Repos are duplicated server-side via the
-    HuggingFace API, then only the README is pulled locally for editing.
-    Branch-to-main promotion is done via git with GIT_LFS_SKIP_SMUDGE=1
-    (only LFS pointers, since the LFS objects already exist in the repo).
 
 Requires: huggingface_hub  (pip install huggingface_hub)
 """
@@ -139,34 +134,42 @@ def rewrite_readme(
 
 # ── Core Logic ───────────────────────────────────────────────────────────────
 
-def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 60):
-    """Poll until a branch exists on a HuggingFace repo (e.g. after duplicate_repo)."""
-    import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        try:
-            refs = api.list_repo_refs(repo_id, repo_type="model")
-            branch_names = [b.name for b in refs.branches]
-            if branch in branch_names:
-                return
-        except Exception:
-            pass
-        print(f"    Waiting for branch {branch} to appear on {repo_id}...")
-        _time.sleep(2)
-    raise TimeoutError(
-        f"Branch {branch} did not appear on {repo_id} within {timeout}s"
+def _clone_branch_and_update_readme(*, hf_url, repo_id, branch, readme_text, tmpdir):
+    """Clone a single branch (LFS skip), update README, prepare for push."""
+    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+    run_git(
+        ["git", "clone", "--single-branch", "--branch", branch,
+         hf_url(repo_id), tmpdir],
+        env=lfs_env,
     )
 
-def push_branch_to_main(
-    *,
-    repo_id: str,
-    branch: str,
-    readme_text: str,
-    token: str,
-):
-    """Push a branch as main within the same repo (no large file downloads).
+    run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
+    run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
 
-    Clones with GIT_LFS_SKIP_SMUDGE=1 so only LFS pointers touch disk.
+    # Write the updated README
+    with open(os.path.join(tmpdir, "README.md"), "w") as f:
+        f.write(readme_text)
+
+    run_git(["git", "add", "README.md"], cwd=tmpdir)
+
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=tmpdir, capture_output=True,
+    )
+    if diff.returncode != 0:
+        run_git(
+            ["git", "commit", "-m",
+             "Update README: branch links -> single-repo links"],
+            cwd=tmpdir,
+        )
+
+    run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
+
+
+def push_branch_to_main(*, repo_id, branch, readme_text, token):
+    """Push a branch as main within the SAME repo (no large file downloads).
+
     Since the push target is the same repo, the LFS objects already exist
     server-side and HuggingFace accepts the pointers.
     """
@@ -176,37 +179,53 @@ def push_branch_to_main(
         return f"https://user:{token}@huggingface.co/{rid}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        _clone_branch_and_update_readme(
+            hf_url=hf_url, repo_id=repo_id, branch=branch,
+            readme_text=readme_text, tmpdir=tmpdir,
+        )
         run_git(
-            ["git", "clone", "--single-branch", "--branch", branch,
-             hf_url(repo_id), tmpdir],
-            env=lfs_env,
+            ["git", "push", "-u", "origin", "main", "--force"],
+            cwd=tmpdir, env=lfs_env,
         )
 
-        # Ensure git identity is configured (temp repos may lack it)
-        run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
-        run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
 
-        # Write the updated README
-        readme_path = os.path.join(tmpdir, "README.md")
-        with open(readme_path, "w") as f:
-            f.write(readme_text)
+def transfer_branch_to_new_repo(*, source_repo, branch, target_repo, readme_text, token):
+    """Transfer a single branch from one repo to a NEW repo via git LFS.
 
-        run_git(["git", "add", "README.md"], cwd=tmpdir)
+    Streams LFS objects through the local machine one branch at a time:
+      1. Clone branch from source (LFS pointers only)
+      2. git lfs fetch — download LFS objects into .git/lfs/objects/ cache
+      3. Swap remote to target
+      4. git lfs push — upload LFS objects to the new repo
+      5. git push — push the git history (with pointers)
 
-        # Only commit if there are changes (README might already match)
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=tmpdir, capture_output=True,
+    The temp directory is cleaned up after, so only one branch worth of
+    LFS data is on disk at any time.
+    """
+    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+    def hf_url(rid):
+        return f"https://user:{token}@huggingface.co/{rid}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _clone_branch_and_update_readme(
+            hf_url=hf_url, repo_id=source_repo, branch=branch,
+            readme_text=readme_text, tmpdir=tmpdir,
         )
-        if diff.returncode != 0:
-            run_git(
-                ["git", "commit", "-m",
-                 "Update README: branch links -> single-repo links"],
-                cwd=tmpdir,
-            )
 
-        # Rename current branch to main and force-push
-        run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
+        # Fetch LFS objects from source into the local cache
+        print("    Fetching LFS objects from source...")
+        run_git(["git", "lfs", "fetch", "origin", "--all"], cwd=tmpdir)
+
+        # Swap remote to the target repo
+        run_git(
+            ["git", "remote", "set-url", "origin", hf_url(target_repo)],
+            cwd=tmpdir,
+        )
+
+        # Push LFS objects to the new repo, then push git history
+        print("    Pushing LFS objects to target...")
+        run_git(["git", "lfs", "push", "origin", "--all"], cwd=tmpdir)
         run_git(
             ["git", "push", "-u", "origin", "main", "--force"],
             cwd=tmpdir, env=lfs_env,
@@ -282,7 +301,7 @@ def main():
 
     # ── 2. Create repos for smaller BPWs ─────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"Step 2: Duplicate & configure repos for smaller BPWs")
+    print(f"Step 2: Create repos for smaller BPWs")
     print(f"{'=' * 60}")
 
     for bpw in smaller_bpws:
@@ -290,39 +309,19 @@ def main():
         repo_id = target_id(bpw)
         print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
-        # Duplicate the parent repo server-side (includes all branches + LFS)
-        print(f"  Duplicating {parent_repo} → {repo_id}")
-        api.duplicate_repo(
-            from_id=parent_repo,
-            to_id=repo_id,
-            private=args.private,
-            exist_ok=True,
-            repo_type="model",
-        )
+        api.create_repo(repo_id, exist_ok=True, repo_type="model", private=args.private)
         time.sleep(0.5)
 
-        # Wait for the duplication to finish (branches may not be available immediately)
-        wait_for_branch(api, repo_id, branch)
-
-        # Push the correct branch as main (same repo, LFS objects already there)
-        push_branch_to_main(
-            repo_id=repo_id,
+        # Transfer just this branch's files (streams LFS through local machine)
+        transfer_branch_to_new_repo(
+            source_repo=parent_repo,
             branch=branch,
+            target_repo=repo_id,
             readme_text=readme_text,
             token=token,
         )
-        time.sleep(0.5)
-
-        # Delete all the other BPW branches from the duplicate
-        for other_bpw in bpws:
-            other_branch = f"{fmt_bpw(other_bpw)}bpw"
-            try:
-                api.delete_branch(repo_id, other_branch, repo_type="model")
-                time.sleep(0.5)
-            except Exception:
-                pass  # Branch may not exist or already deleted
-
         print(f"  ✓ {repo_id}")
+        time.sleep(0.5)
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
