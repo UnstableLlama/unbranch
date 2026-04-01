@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+unbranch.py — Split a HuggingFace repo with branched quantizations into
+separate single-BPW repos, entirely server-side (no large file downloads).
+
+Usage:
+    export HF_TOKEN=hf_...
+    python unbranch.py \
+        --author UnstableLlama \
+        --repo-name Qwen3.5-4B-exl3 \
+        --bpws 2.10 3.00 4.00 5.00 6.00
+
+What it does:
+    1. Downloads the README from the parent repo and rewrites branch links
+       to point at the new single-BPW repos.
+    2. For every BPW *except* the largest: creates a new repo, clones the
+       branch (LFS pointers only — no large files touch disk), writes the
+       updated README, and pushes as main.
+    3. For the largest BPW: force-pushes that branch to the parent repo's
+       main branch (with updated README), then renames the parent repo.
+    4. Verifies every new repo has files.
+    5. Deletes the old BPW branches from the (now-renamed) parent repo.
+
+Requires: huggingface_hub  (pip install huggingface_hub)
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+from huggingface_hub import HfApi, hf_hub_download
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def fmt_bpw(bpw: float) -> str:
+    """Format a BPW value to two decimal places."""
+    return f"{bpw:.2f}"
+
+
+def run_git(args: list[str], cwd: str | None = None, env: dict | None = None):
+    """Run a git command, printing it and raising on failure."""
+    merged_env = {**os.environ, **(env or {})}
+    display = " ".join(args)
+    # Redact tokens from display
+    display = re.sub(r"(https?://)[^@]+@", r"\1***@", display)
+    print(f"  $ {display}")
+    result = subprocess.run(
+        args, cwd=cwd, env=merged_env, capture_output=True, text=True
+    )
+    if result.stdout.strip():
+        for line in result.stdout.strip().splitlines()[:10]:
+            print(f"    {line}")
+    if result.returncode != 0:
+        print(f"    STDERR: {result.stderr.strip()}")
+        result.check_returncode()
+    return result
+
+
+# ── README Rewriting ─────────────────────────────────────────────────────────
+
+def rewrite_readme(
+    readme: str,
+    author: str,
+    repo_name: str,
+    bpws: list[float],
+) -> str:
+    """Replace branch-style URLs/commands with single-repo equivalents."""
+
+    parent = f"{author}/{repo_name}"
+
+    for bpw in bpws:
+        b = fmt_bpw(bpw)
+        branch = f"{b}bpw"
+        target = f"{author}/{repo_name}-{branch}"
+
+        # Table / inline links:  …/Author/Repo/tree/X.XXbpw  →  …/Author/Repo-X.XXbpw
+        readme = readme.replace(
+            f"{parent}/tree/{branch}",
+            f"{target}",
+        )
+
+        # CLI download with quoted revision:
+        #   hf download Author/Repo --revision "X.XXbpw" --local-dir …
+        #   →  hf download Author/Repo-X.XXbpw --local-dir …
+        readme = readme.replace(
+            f'{parent} --revision "{branch}"',
+            f"{target}",
+        )
+
+        # CLI download with unquoted revision:
+        readme = readme.replace(
+            f"{parent} --revision {branch}",
+            f"{target}",
+        )
+
+    return readme
+
+
+# ── Core Logic ───────────────────────────────────────────────────────────────
+
+def push_branch_as_main(
+    *,
+    source_repo: str,
+    branch: str,
+    target_repo: str,
+    readme_text: str,
+    token: str,
+):
+    """Clone a branch (LFS pointers only) and push it as main to target_repo."""
+    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+    def hf_url(repo_id):
+        return f"https://user:{token}@huggingface.co/{repo_id}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_git(
+            ["git", "clone", "--single-branch", "--branch", branch,
+             hf_url(source_repo), tmpdir],
+            env=lfs_env,
+        )
+
+        # Ensure git identity is configured (temp repos may lack it)
+        run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
+        run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
+
+        # Write the updated README
+        readme_path = os.path.join(tmpdir, "README.md")
+        with open(readme_path, "w") as f:
+            f.write(readme_text)
+
+        run_git(["git", "add", "README.md"], cwd=tmpdir)
+
+        # Only commit if there are changes (README might already match)
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=tmpdir, capture_output=True,
+        )
+        if diff.returncode != 0:
+            run_git(
+                ["git", "commit", "-m",
+                 "Update README: branch links -> single-repo links"],
+                cwd=tmpdir,
+            )
+
+        # Rename current branch to main
+        run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
+
+        # Point remote at the target and push
+        run_git(
+            ["git", "remote", "set-url", "origin", hf_url(target_repo)],
+            cwd=tmpdir,
+        )
+        run_git(
+            ["git", "push", "-u", "origin", "main", "--force"],
+            cwd=tmpdir, env=lfs_env,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Split a branched HF quant repo into single-BPW repos.",
+    )
+    parser.add_argument("--author", required=True, help="HF username or org")
+    parser.add_argument("--repo-name", required=True, help="Source repo name (without author)")
+    parser.add_argument(
+        "--bpws", nargs="+", required=True, type=float,
+        help="BPW values present as branches (e.g. 2.10 3.00 4.00 5.00 6.00)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would happen without making changes",
+    )
+    args = parser.parse_args()
+
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("Error: Set the HF_TOKEN environment variable first.")
+        sys.exit(1)
+
+    api = HfApi(token=token)
+
+    bpws = sorted(args.bpws)
+    largest_bpw = bpws[-1]
+    smaller_bpws = bpws[:-1]
+
+    parent_repo = f"{args.author}/{args.repo_name}"
+
+    def target_name(bpw):
+        return f"{args.repo_name}-{fmt_bpw(bpw)}bpw"
+
+    def target_id(bpw):
+        return f"{args.author}/{target_name(bpw)}"
+
+    # ── 1. Download & rewrite README ─────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Step 1: Download & rewrite README from {parent_repo}")
+    print(f"{'=' * 60}\n")
+
+    readme_file = hf_hub_download(parent_repo, "README.md", token=token)
+    with open(readme_file) as f:
+        original_readme = f.read()
+
+    readme_text = rewrite_readme(original_readme, args.author, args.repo_name, bpws)
+
+    # Show a quick diff summary
+    changed = original_readme != readme_text
+    print(f"  README modified: {changed}")
+    if changed:
+        old_lines = set(original_readme.splitlines())
+        new_lines = set(readme_text.splitlines())
+        for line in sorted(new_lines - old_lines):
+            if "huggingface.co" in line or "hf download" in line:
+                print(f"    + {line.strip()[:120]}")
+
+    if args.dry_run:
+        print(f"\n[DRY RUN] Would create these repos:")
+        for bpw in smaller_bpws:
+            print(f"  NEW  {target_id(bpw)}  ← branch {fmt_bpw(bpw)}bpw")
+        print(f"  RENAME {parent_repo} → {target_id(largest_bpw)}  ← branch {fmt_bpw(largest_bpw)}bpw → main")
+        return
+
+    # ── 2. Create repos for smaller BPWs ─────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Step 2: Create repos for smaller BPWs")
+    print(f"{'=' * 60}")
+
+    for bpw in smaller_bpws:
+        branch = f"{fmt_bpw(bpw)}bpw"
+        repo_id = target_id(bpw)
+        print(f"\n  ── {repo_id} (from branch {branch}) ──")
+
+        api.create_repo(repo_id, exist_ok=True, repo_type="model")
+
+        push_branch_as_main(
+            source_repo=parent_repo,
+            branch=branch,
+            target_repo=repo_id,
+            readme_text=readme_text,
+            token=token,
+        )
+        print(f"  ✓ {repo_id}")
+
+    # ── 3. Handle parent repo → largest BPW ──────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Step 3: Convert parent repo to largest BPW ({fmt_bpw(largest_bpw)})")
+    print(f"{'=' * 60}\n")
+
+    largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
+    largest_repo = target_id(largest_bpw)
+
+    # Push the largest branch as main (still using the old repo name)
+    print(f"  Pushing {largest_branch} → main on {parent_repo}")
+    push_branch_as_main(
+        source_repo=parent_repo,
+        branch=largest_branch,
+        target_repo=parent_repo,
+        readme_text=readme_text,
+        token=token,
+    )
+
+    # Rename the repo
+    print(f"\n  Renaming {parent_repo} → {largest_repo}")
+    api.move_repo(from_id=parent_repo, to_id=largest_repo, repo_type="model")
+    print(f"  ✓ Renamed")
+
+    # ── 4. Verify ────────────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Step 4: Verification")
+    print(f"{'=' * 60}\n")
+
+    all_ok = True
+    for bpw in bpws:
+        repo_id = target_id(bpw)
+        try:
+            files = api.list_repo_files(repo_id, repo_type="model")
+            count = len(files)
+            has_safetensors = any(f.endswith(".safetensors") for f in files)
+            status = "OK" if count >= 2 and has_safetensors else "⚠ CHECK"
+            print(f"  {repo_id}: {count} files [{status}]")
+            if count < 2 or not has_safetensors:
+                all_ok = False
+        except Exception as e:
+            print(f"  {repo_id}: ERROR — {e}")
+            all_ok = False
+
+    if not all_ok:
+        print("\n  ⚠ Some repos may have issues. Skipping branch cleanup.")
+        print("  Please verify manually, then delete branches with:")
+        for bpw in bpws:
+            branch = f"{fmt_bpw(bpw)}bpw"
+            print(f"    huggingface_hub.HfApi().delete_branch('{largest_repo}', '{branch}')")
+        sys.exit(1)
+
+    # ── 5. Delete old branches ───────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Step 5: Delete old branches from {largest_repo}")
+    print(f"{'=' * 60}\n")
+
+    for bpw in bpws:
+        branch = f"{fmt_bpw(bpw)}bpw"
+        try:
+            api.delete_branch(largest_repo, branch, repo_type="model")
+            print(f"  Deleted: {branch}")
+        except Exception as e:
+            print(f"  Could not delete {branch}: {e}")
+
+    # ── Done ─────────────────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"Done! Created {len(bpws)} single-BPW repos:")
+    for bpw in bpws:
+        print(f"  https://huggingface.co/{target_id(bpw)}")
+    print(f"{'=' * 60}\n")
+
+
+if __name__ == "__main__":
+    main()
