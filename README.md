@@ -26,7 +26,7 @@ AFTER (unbranched):
   UnstableLlama/Qwen3.5-4B-6.00bpw-exl3  (renamed parent)
 ```
 
-The largest BPW gets the renamed parent repo, preserving download counts and stars.
+The largest BPW gets the renamed parent repo, preserving download counts and stars. The original main branch content is saved as a `main_original` branch on that repo, so nothing is lost.
 
 ## How it works
 
@@ -40,6 +40,8 @@ Pure HuggingFace API — no git, no model file downloads. The only file that tou
 3. For the largest BPW: copy branch → parent's main, rename the parent repo.
 4. Verifies all repos have files.
 5. Deletes the old BPW branches from the renamed parent.
+
+The original parent repo's main branch content is preserved as a branch called `main_original` on the renamed (largest BPW) repo.
 
 ## Requirements
 
