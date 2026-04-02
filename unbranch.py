@@ -192,11 +192,10 @@ def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 120):
 
 
 def push_branch_to_main(*, repo_id, branch, readme_text, token):
-    """Push a branch as main within the SAME repo (no large file downloads).
+    """Push a branch as main within the SAME repo (for duplicated repos).
 
-    Clones with GIT_LFS_SKIP_SMUDGE=1 so only LFS pointers touch disk.
-    Since the push target is the same repo, the LFS objects already exist
-    server-side and HuggingFace accepts the pointers.
+    Clones the branch, renames to main, force-pushes. This is safe for
+    duplicated repos where we don't care about main's history.
     """
     lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
 
@@ -210,6 +209,64 @@ def push_branch_to_main(*, repo_id, branch, readme_text, token):
         )
         run_git(
             ["git", "push", "-u", "origin", "main", "--force"],
+            cwd=tmpdir, env=lfs_env,
+        )
+
+
+def merge_branch_to_main(*, repo_id, branch, readme_text, token):
+    """Merge a branch into main within the SAME repo (for the parent repo).
+
+    Clones main, fetches the branch, merges with --allow-unrelated-histories
+    using the branch's content (theirs strategy), then updates the README.
+    This preserves the main branch history and download counts.
+    """
+    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+    def hf_url(rid):
+        return f"https://user:{token}@huggingface.co/{rid}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Clone main
+        run_git(
+            ["git", "clone", "--single-branch", "--branch", "main",
+             hf_url(repo_id), tmpdir],
+            env=lfs_env,
+        )
+
+        run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
+        run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
+
+        # Fetch the BPW branch
+        run_git(["git", "fetch", "origin", branch], cwd=tmpdir, env=lfs_env)
+
+        # Merge the branch into main, taking the branch's content on conflicts
+        run_git(
+            ["git", "merge", f"origin/{branch}",
+             "--allow-unrelated-histories",
+             "-X", "theirs",
+             "-m", f"Merge {branch} into main"],
+            cwd=tmpdir,
+        )
+
+        # Write the updated README on top of the merge
+        with open(os.path.join(tmpdir, "README.md"), "w") as f:
+            f.write(readme_text)
+
+        run_git(["git", "add", "README.md"], cwd=tmpdir)
+
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=tmpdir, capture_output=True,
+        )
+        if diff.returncode != 0:
+            run_git(
+                ["git", "commit", "-m",
+                 "Update README: branch links -> single-repo links"],
+                cwd=tmpdir,
+            )
+
+        run_git(
+            ["git", "push", "-u", "origin", "main"],
             cwd=tmpdir, env=lfs_env,
         )
 
@@ -335,11 +392,11 @@ def main():
     print(f"{'=' * 60}\n")
 
     if args.dry_run:
-        print(f"  [DRY RUN] Would push {largest_branch} → main on {parent_repo}")
+        print(f"  [DRY RUN] Would merge {largest_branch} → main on {parent_repo}")
         print(f"  [DRY RUN] Would rename {parent_repo} → {largest_repo}")
     else:
-        print(f"  Pushing {largest_branch} → main on {parent_repo}")
-        push_branch_to_main(
+        print(f"  Merging {largest_branch} → main on {parent_repo}")
+        merge_branch_to_main(
             repo_id=parent_repo,
             branch=largest_branch,
             readme_text=readme_text,
