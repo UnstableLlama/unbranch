@@ -190,6 +190,62 @@ def restore_main_from_backup(api, repo_id: str, backup_branch: str):
     print(f"    Main restored.")
 
 
+def merge_original_main_files(api, repo_id: str, original_branch: str = "main_original"):
+    """Copy non-conflicting files from main_original into main.
+
+    Files that already exist on main are skipped (no overwrites).
+    Returns True if all files were copied (or there were none to copy),
+    False if any files were skipped due to conflicts.
+    """
+    try:
+        orig_files = list_branch_files(api, repo_id, original_branch)
+    except Exception:
+        print(f"    No {original_branch} branch found on {repo_id}, skipping.")
+        return True
+
+    main_files = list_main_files(api, repo_id)
+    main_filenames = {f.rfilename for f in main_files}
+
+    operations = []
+    skipped = []
+
+    for f in orig_files:
+        if f.rfilename in main_filenames:
+            skipped.append(f.rfilename)
+        else:
+            operations.append(CommitOperationCopy(
+                src_path_in_repo=f.rfilename,
+                path_in_repo=f.rfilename,
+                src_revision=original_branch,
+            ))
+
+    if operations:
+        print(f"    Copying {len(operations)} file(s) from {original_branch}...")
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="model",
+            operations=operations,
+            commit_message=f"Add shared files from original main branch",
+            revision="main",
+        )
+    else:
+        print(f"    No new files to copy from {original_branch}.")
+
+    if skipped:
+        print(f"    Skipped {len(skipped)} file(s) (already exist on main):")
+        for name in skipped:
+            print(f"      - {name}")
+        return False
+
+    # All files copied (or none to copy) — safe to delete the branch
+    try:
+        api.delete_branch(repo_id, branch=original_branch, repo_type="model")
+        print(f"    Deleted {original_branch} branch (all files merged).")
+    except Exception:
+        pass
+    return True
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -313,11 +369,19 @@ def main():
                     time.sleep(0.5)
                 except Exception:
                     pass
-            # Also delete the backup branch from the duplicate
+
+            # f. Rename backup branch to main_original, merge shared files into main
             try:
+                api.create_branch(
+                    repo_id, branch="main_original",
+                    repo_type="model", revision=backup_branch,
+                )
                 api.delete_branch(repo_id, branch=backup_branch, repo_type="model")
             except Exception:
                 pass
+            print(f"  Merging shared files from original main...")
+            merge_original_main_files(api, repo_id)
+            time.sleep(0.5)
 
             print(f"  ✓ {repo_id}")
 
@@ -344,6 +408,11 @@ def main():
     else:
         print(f"  Copying {largest_branch} → main on {parent_repo} (via API)")
         copy_branch_to_main(api, parent_repo, largest_branch, readme_text)
+        time.sleep(0.5)
+
+        # Merge shared files from original main into the largest BPW
+        print(f"  Merging shared files from original main...")
+        merge_original_main_files(api, parent_repo)
         time.sleep(0.5)
 
         print(f"\n  Renaming {parent_repo} → {largest_repo}")
