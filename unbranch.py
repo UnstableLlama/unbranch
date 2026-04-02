@@ -218,62 +218,49 @@ def push_branch_to_main(*, repo_id, branch, readme_text, token):
         )
 
 
-def merge_branch_to_main(*, repo_id, branch, readme_text, token):
-    """Merge a branch into main within the SAME repo (for the parent repo).
+def copy_branch_to_main_via_api(*, api, repo_id, branch, readme_text):
+    """Copy files from a branch to main using HF API (no git, no downloads).
 
-    Clones main, fetches the branch, merges with --allow-unrelated-histories
-    using the branch's content (theirs strategy), then updates the README.
-    This preserves the main branch history and download counts.
+    Uses CommitOperationCopy with src_revision to server-side copy every file
+    from the branch to main, then uploads the updated README on top.
+    Works only within the same repo.
     """
-    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+    from huggingface_hub import CommitOperationCopy, CommitOperationAdd
 
-    def hf_url(rid):
-        return f"https://user:{token}@huggingface.co/{rid}"
+    # List all files on the branch
+    print(f"    Listing files on branch {branch}...")
+    tree_items = list(api.list_repo_tree(
+        repo_id=repo_id, revision=branch, recursive=True, repo_type="model",
+    ))
+    files = [item for item in tree_items if hasattr(item, "rfilename")]
+    print(f"    Found {len(files)} file(s)")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Clone main
-        run_git(
-            ["git", "clone", "--single-branch", "--branch", "main",
-             hf_url(repo_id), tmpdir],
-            env=lfs_env,
-        )
+    # Build copy operations for every file except README (we'll overwrite that)
+    operations = []
+    for f in files:
+        if f.rfilename == "README.md":
+            continue
+        operations.append(CommitOperationCopy(
+            src_path_in_repo=f.rfilename,
+            path_in_repo=f.rfilename,
+            src_revision=branch,
+        ))
 
-        run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
-        run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
+    # Add the updated README
+    operations.append(CommitOperationAdd(
+        path_in_repo="README.md",
+        path_or_fileobj=readme_text.encode(),
+    ))
 
-        # Fetch the BPW branch
-        run_git(["git", "fetch", "origin", branch], cwd=tmpdir, env=lfs_env)
-
-        # Merge the branch into main, taking the branch's content on conflicts
-        run_git(
-            ["git", "merge", f"origin/{branch}",
-             "--allow-unrelated-histories",
-             "-X", "theirs",
-             "-m", f"Merge {branch} into main"],
-            cwd=tmpdir,
-        )
-
-        # Write the updated README on top of the merge
-        with open(os.path.join(tmpdir, "README.md"), "w") as f:
-            f.write(readme_text)
-
-        run_git(["git", "add", "README.md"], cwd=tmpdir)
-
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=tmpdir, capture_output=True,
-        )
-        if diff.returncode != 0:
-            run_git(
-                ["git", "commit", "-m",
-                 "Update README: branch links -> single-repo links"],
-                cwd=tmpdir,
-            )
-
-        run_git(
-            ["git", "push", "-u", "origin", "main"],
-            cwd=tmpdir, env=lfs_env,
-        )
+    print(f"    Committing {len(operations)} operations to main...")
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="model",
+        operations=operations,
+        commit_message=f"Copy {branch} to main and update README links",
+        revision="main",
+    )
+    print(f"    Done.")
 
 
 def main():
@@ -406,15 +393,15 @@ def main():
     print(f"{'=' * 60}\n")
 
     if args.dry_run:
-        print(f"  [DRY RUN] Would merge {largest_branch} → main on {parent_repo}")
+        print(f"  [DRY RUN] Would copy {largest_branch} → main on {parent_repo}")
         print(f"  [DRY RUN] Would rename {parent_repo} → {largest_repo}")
     else:
-        print(f"  Merging {largest_branch} → main on {parent_repo}")
-        merge_branch_to_main(
+        print(f"  Copying {largest_branch} → main on {parent_repo} (via API)")
+        copy_branch_to_main_via_api(
+            api=api,
             repo_id=parent_repo,
             branch=largest_branch,
             readme_text=readme_text,
-            token=token,
         )
         time.sleep(0.5)
 
