@@ -1,6 +1,6 @@
 # unbranch
 
-Split a HuggingFace repo that stores quantized models on separate branches (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos.
+Instantly split a branched HuggingFace repo of quantized models (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos.
 
 > [!CAUTION]
 > **This script performs destructive, irreversible operations.** It overwrites the parent repo's main branch, renames the parent repo, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
