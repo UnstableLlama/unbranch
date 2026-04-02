@@ -5,6 +5,9 @@ Instantly split a branched HuggingFace repo of quantized models (e.g. `2.10bpw`,
 > [!CAUTION]
 > **This script performs destructive, irreversible operations.** It overwrites the parent repo's main branch, renames the parent repo, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
 
+> [!WARNING]
+> **HuggingFace rate limits apply.** `duplicate_repo` is limited to **15 duplications per day**. The general API limit is **1000 requests per 5-minute window**. A repo with 5 BPWs uses 4 duplications (the largest BPW reuses the parent), so you can split ~3-4 repos per day. Plan accordingly.
+
 ## Why
 
 HuggingFace repos that use branches for different quantization bitrates are harder to browse and download. This tool converts them into the cleaner single-repo-per-bitrate convention:
