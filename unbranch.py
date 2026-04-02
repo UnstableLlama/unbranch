@@ -4,8 +4,8 @@ unbranch.py — Split a HuggingFace repo with branched quantizations into
 separate single-BPW repos.
 
 WARNING: This script performs destructive, irreversible operations. It renames
-repos, force-pushes branches to main, and deletes branches. Always use
---dry-run first to preview what will happen.
+repos, overwrites main branches, and deletes branches. Always use --dry-run
+first to preview what will happen.
 
 Usage:
     export HF_TOKEN=hf_...
@@ -14,32 +14,31 @@ Usage:
         --repo-name Qwen3.5-4B-exl3 \
         --bpws 2.10 3.00 4.00 5.00 6.00
 
-What it does:
-    1. Downloads the README from the parent repo and rewrites branch links
-       to point at the new single-BPW repos.
-    2. For every BPW *except* the largest: duplicates the parent repo
-       server-side via HF API, then pushes the correct branch as main
-       and deletes the other branches. No model files are downloaded.
-    3. For the largest BPW: pushes that branch as main on the parent repo,
-       then renames it.
-    4. Verifies every new repo has files.
-    5. Deletes the old BPW branches from the (now-renamed) parent repo.
-
-    The only file downloaded locally is the README. All model weight
-    transfers happen server-side via duplicate_repo().
+How it works (no git, no model file downloads — pure HF API):
+    1. Downloads ONLY the README and rewrites branch links.
+    2. For each smaller BPW:
+       a. CommitOperationCopy: copy branch files → parent's main
+       b. duplicate_repo: snapshot parent's main → new single-BPW repo
+       c. Restore parent's main to its original state
+    3. For the largest BPW: copy branch → parent's main, rename parent.
+    4. Verify all repos have files.
+    5. Delete old branches from the renamed parent.
 
 Requires: huggingface_hub  (pip install huggingface_hub)
 """
 
 import argparse
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import time
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import (
+    CommitOperationAdd,
+    CommitOperationCopy,
+    CommitOperationDelete,
+    HfApi,
+    hf_hub_download,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -49,49 +48,20 @@ def fmt_bpw(bpw: float) -> str:
     return f"{bpw:.2f}"
 
 
-def run_git(args: list[str], cwd: str | None = None, env: dict | None = None):
-    """Run a git command, printing it and raising on failure."""
-    merged_env = {**os.environ, **(env or {})}
-    display = " ".join(args)
-    display = re.sub(r"(https?://)[^@]+@", r"\1***@", display)
-    print(f"  $ {display}")
-    result = subprocess.run(
-        args, cwd=cwd, env=merged_env, capture_output=True, text=True
-    )
-    if result.stdout.strip():
-        for line in result.stdout.strip().splitlines()[:10]:
-            print(f"    {line}")
-    if result.returncode != 0:
-        print(f"    STDERR: {result.stderr.strip()}")
-        result.check_returncode()
-    return result
-
-
-# ── README Rewriting ─────────────────────────────────────────────────────────
-
 def make_target_name(repo_name: str, bpw: float) -> str:
     """Build the single-BPW repo name by inserting the BPW before the quant suffix.
 
     Example: Qwen3.5-4B-exl3  +  4.00  →  Qwen3.5-4B-4.00bpw-exl3
     """
-    # Known quantization suffixes (add more as needed)
     for suffix in ("-exl3", "-exl2", "-gguf", "-gptq", "-awq"):
         if repo_name.endswith(suffix):
             base = repo_name[: -len(suffix)]
             return f"{base}-{fmt_bpw(bpw)}bpw{suffix}"
-
-    # Fallback: append at end
     return f"{repo_name}-{fmt_bpw(bpw)}bpw"
 
 
-def rewrite_readme(
-    readme: str,
-    author: str,
-    repo_name: str,
-    bpws: list[float],
-) -> str:
+def rewrite_readme(readme: str, author: str, repo_name: str, bpws: list[float]) -> str:
     """Replace branch-style URLs/commands with single-repo equivalents."""
-
     parent = f"{author}/{repo_name}"
 
     for bpw in bpws:
@@ -99,182 +69,150 @@ def rewrite_readme(
         branch = f"{b}bpw"
         target = f"{author}/{make_target_name(repo_name, bpw)}"
 
-        # Table / inline links:  …/Author/Repo/tree/X.XXbpw  →  …/Author/Repo-X.XXbpw-exl3
-        readme = readme.replace(
-            f"{parent}/tree/{branch}",
-            f"{target}",
-        )
+        readme = readme.replace(f"{parent}/tree/{branch}", target)
+        readme = readme.replace(f'{parent} --revision "{branch}"', target)
+        readme = readme.replace(f"{parent} --revision {branch}", target)
 
-        # CLI download with quoted revision:
-        #   hf download Author/Repo --revision "X.XXbpw" --local-dir …
-        #   →  hf download Author/Repo-X.XXbpw-exl3 --local-dir …
-        readme = readme.replace(
-            f'{parent} --revision "{branch}"',
-            f"{target}",
-        )
-
-        # CLI download with unquoted revision:
-        readme = readme.replace(
-            f"{parent} --revision {branch}",
-            f"{target}",
-        )
-
-    # Also update --local-dir references to match new naming
-    # Old: --local-dir ./Repo-X.XXbpw  →  --local-dir ./NewRepoName
     for bpw in bpws:
         b = fmt_bpw(bpw)
         old_dir = f"{repo_name}-{b}bpw"
         new_dir = make_target_name(repo_name, bpw)
         if old_dir != new_dir:
-            readme = readme.replace(
-                f"--local-dir ./{old_dir}",
-                f"--local-dir ./{new_dir}",
-            )
+            readme = readme.replace(f"--local-dir ./{old_dir}", f"--local-dir ./{new_dir}")
 
     return readme
 
 
-# ── Core Logic ───────────────────────────────────────────────────────────────
+# ── Core API Operations ─────────────────────────────────────────────────────
 
-def _clone_branch_and_update_readme(*, hf_url, repo_id, branch, readme_text, tmpdir):
-    """Clone a single branch (LFS skip), update README, prepare for push."""
-    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+def list_branch_files(api, repo_id: str, branch: str) -> list:
+    """List all files on a branch."""
+    items = list(api.list_repo_tree(
+        repo_id=repo_id, revision=branch, recursive=True, repo_type="model",
+    ))
+    return [item for item in items if hasattr(item, "rfilename")]
 
-    run_git(
-        ["git", "clone", "--single-branch", "--branch", branch,
-         hf_url(repo_id), tmpdir],
-        env=lfs_env,
+
+def list_main_files(api, repo_id: str) -> list:
+    """List all files on main."""
+    return list_branch_files(api, repo_id, "main")
+
+
+def copy_branch_to_main(api, repo_id: str, branch: str, readme_text: str):
+    """Server-side copy: overwrite main with branch content + updated README."""
+    print(f"    Listing files on branch {branch}...")
+    branch_files = list_branch_files(api, repo_id, branch)
+    print(f"    Found {len(branch_files)} file(s)")
+
+    operations = []
+
+    # Copy every file from the branch (except README which we'll add fresh)
+    for f in branch_files:
+        if f.rfilename == "README.md":
+            continue
+        operations.append(CommitOperationCopy(
+            src_path_in_repo=f.rfilename,
+            path_in_repo=f.rfilename,
+            src_revision=branch,
+        ))
+
+    # Add the rewritten README
+    operations.append(CommitOperationAdd(
+        path_in_repo="README.md",
+        path_or_fileobj=readme_text.encode(),
+    ))
+
+    # Delete any files on main that aren't on the branch
+    main_files = list_main_files(api, repo_id)
+    branch_filenames = {f.rfilename for f in branch_files} | {"README.md"}
+    for f in main_files:
+        if f.rfilename not in branch_filenames:
+            operations.append(CommitOperationDelete(path_in_repo=f.rfilename))
+
+    print(f"    Committing {len(operations)} operations to main...")
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="model",
+        operations=operations,
+        commit_message=f"Copy {branch} to main and update README",
+        revision="main",
     )
 
-    run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
-    run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
 
-    # Write the updated README
-    with open(os.path.join(tmpdir, "README.md"), "w") as f:
-        f.write(readme_text)
+def restore_main(api, repo_id: str, original_main_files: list, original_readme: str):
+    """Restore parent's main branch to its original state."""
+    print(f"    Restoring parent main...")
 
-    run_git(["git", "add", "README.md"], cwd=tmpdir)
+    current_files = list_main_files(api, repo_id)
+    original_filenames = {f.rfilename for f in original_main_files}
 
-    diff = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"],
-        cwd=tmpdir, capture_output=True,
-    )
-    if diff.returncode != 0:
-        run_git(
-            ["git", "commit", "-m",
-             "Update README: branch links -> single-repo links"],
-            cwd=tmpdir,
-        )
+    operations = []
 
-    run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
+    # Copy back original files from... wait, we need the original commit.
+    # Simpler: we saved the original main file list. We can use
+    # CommitOperationCopy with src_revision pointing to the commit before
+    # our changes. But we don't have that easily.
+    #
+    # Better approach: just delete everything and re-copy from the original
+    # main state. But we need a reference to it.
+    #
+    # Simplest: before we modify main, we create a backup branch.
+    # Then restore from the backup branch.
+    raise NotImplementedError("Use save/restore pattern instead")
 
 
-def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 600):
-    """Poll until a branch exists on a HuggingFace repo.
-
-    duplicate_repo() is async on HF's side — for large repos with many GB
-    of LFS data, the server-side copy can take several minutes.
-    """
-    start = time.time()
-    deadline = start + timeout
-    while time.time() < deadline:
+def save_main_as_backup(api, repo_id: str):
+    """Create a backup branch of main before we start modifying it."""
+    backup_branch = "_unbranch_backup_main"
+    try:
+        api.create_branch(repo_id, branch=backup_branch, repo_type="model", revision="main")
+        print(f"    Created backup branch: {backup_branch}")
+    except Exception:
+        # Branch might already exist from a previous run — delete and recreate
         try:
-            refs = api.list_repo_refs(repo_id, repo_type="model")
-            branch_names = [b.name for b in refs.branches]
-            if branch in branch_names:
-                elapsed = int(time.time() - start)
-                print(f"    Branch {branch} ready ({elapsed}s)")
-                return
+            api.delete_branch(repo_id, branch=backup_branch, repo_type="model")
         except Exception:
             pass
-        elapsed = int(time.time() - start)
-        print(f"    Waiting for HF server-side duplication... ({elapsed}s / {timeout}s)")
-        time.sleep(5)
-    raise TimeoutError(
-        f"Branch {branch} did not appear on {repo_id} within {timeout}s. "
-        f"The repo may still be duplicating — check https://huggingface.co/{repo_id} manually."
-    )
+        api.create_branch(repo_id, branch=backup_branch, repo_type="model", revision="main")
+        print(f"    Recreated backup branch: {backup_branch}")
+    return backup_branch
 
 
-def push_branch_to_main(*, repo_id, branch, readme_text, token):
-    """Push a branch as main within the SAME repo (for duplicated repos).
+def restore_main_from_backup(api, repo_id: str, backup_branch: str):
+    """Restore main from the backup branch."""
+    print(f"    Restoring main from {backup_branch}...")
 
-    Clones the branch, renames to main, force-pushes. This is safe for
-    duplicated repos where we don't care about main's history.
-    """
-    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
+    backup_files = list_branch_files(api, repo_id, backup_branch)
+    current_files = list_main_files(api, repo_id)
 
-    def hf_url(rid):
-        return f"https://user:{token}@huggingface.co/{rid}"
+    operations = []
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _clone_branch_and_update_readme(
-            hf_url=hf_url, repo_id=repo_id, branch=branch,
-            readme_text=readme_text, tmpdir=tmpdir,
+    # Copy all files from backup
+    for f in backup_files:
+        operations.append(CommitOperationCopy(
+            src_path_in_repo=f.rfilename,
+            path_in_repo=f.rfilename,
+            src_revision=backup_branch,
+        ))
+
+    # Delete files that aren't in the backup
+    backup_filenames = {f.rfilename for f in backup_files}
+    for f in current_files:
+        if f.rfilename not in backup_filenames:
+            operations.append(CommitOperationDelete(path_in_repo=f.rfilename))
+
+    if operations:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="model",
+            operations=operations,
+            commit_message="Restore main from backup",
+            revision="main",
         )
-        run_git(
-            ["git", "push", "-u", "origin", "main", "--force"],
-            cwd=tmpdir, env=lfs_env,
-        )
+    print(f"    Main restored.")
 
 
-def merge_branch_to_main(*, repo_id, branch, readme_text, token):
-    """Merge a branch into main within the SAME repo (for the parent repo).
-
-    Clones main, fetches the branch, merges with --allow-unrelated-histories
-    using the branch's content (theirs strategy), then updates the README.
-    This preserves the main branch history and download counts.
-    """
-    lfs_env = {"GIT_LFS_SKIP_SMUDGE": "1"}
-
-    def hf_url(rid):
-        return f"https://user:{token}@huggingface.co/{rid}"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Clone main
-        run_git(
-            ["git", "clone", "--single-branch", "--branch", "main",
-             hf_url(repo_id), tmpdir],
-            env=lfs_env,
-        )
-
-        run_git(["git", "config", "user.email", "unbranch@local"], cwd=tmpdir)
-        run_git(["git", "config", "user.name", "unbranch"], cwd=tmpdir)
-
-        # Fetch the BPW branch
-        run_git(["git", "fetch", "origin", branch], cwd=tmpdir, env=lfs_env)
-
-        # Merge the branch into main, taking the branch's content on conflicts
-        run_git(
-            ["git", "merge", f"origin/{branch}",
-             "--allow-unrelated-histories",
-             "-X", "theirs",
-             "-m", f"Merge {branch} into main"],
-            cwd=tmpdir,
-        )
-
-        # Write the updated README on top of the merge
-        with open(os.path.join(tmpdir, "README.md"), "w") as f:
-            f.write(readme_text)
-
-        run_git(["git", "add", "README.md"], cwd=tmpdir)
-
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=tmpdir, capture_output=True,
-        )
-        if diff.returncode != 0:
-            run_git(
-                ["git", "commit", "-m",
-                 "Update README: branch links -> single-repo links"],
-                cwd=tmpdir,
-            )
-
-        run_git(
-            ["git", "push", "-u", "origin", "main"],
-            cwd=tmpdir, env=lfs_env,
-        )
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -319,6 +257,9 @@ def main():
     def target_id(bpw):
         return f"{args.author}/{target_name(bpw)}"
 
+    largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
+    largest_repo = target_id(largest_bpw)
+
     # ── 1. Download & rewrite README ─────────────────────────────────────
     print(f"\n{'=' * 60}")
     print(f"Step 1: Download & rewrite README from {parent_repo}")
@@ -330,7 +271,6 @@ def main():
 
     readme_text = rewrite_readme(original_readme, args.author, args.repo_name, bpws)
 
-    # Show a quick diff summary
     changed = original_readme != readme_text
     print(f"  README modified: {changed}")
     if changed:
@@ -339,9 +279,6 @@ def main():
         for line in sorted(new_lines - old_lines):
             if "huggingface.co" in line or "hf download" in line:
                 print(f"    + {line.strip()[:120]}")
-
-    largest_branch = f"{fmt_bpw(largest_bpw)}bpw"
-    largest_repo = target_id(largest_bpw)
 
     # ── 2. Create repos for smaller BPWs ─────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -352,23 +289,32 @@ def main():
         for bpw in smaller_bpws:
             print(f"  [DRY RUN] Would create {target_id(bpw)} ← branch {fmt_bpw(bpw)}bpw")
     else:
+        # Back up parent's main so we can restore it after each cycle
+        print(f"\n  Backing up parent main branch...")
+        backup_branch = save_main_as_backup(api, parent_repo)
+        time.sleep(0.5)
+
         for bpw in smaller_bpws:
             branch = f"{fmt_bpw(bpw)}bpw"
             repo_id = target_id(bpw)
             print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
-            # Delete target if it exists from a previous failed run
-            # (duplicate_repo with exist_ok silently skips, leaving stale repos)
+            # a. Copy branch files → parent's main
+            print(f"  Copying {branch} → main on parent...")
+            copy_branch_to_main(api, parent_repo, branch, readme_text)
+            time.sleep(0.5)
+
+            # b. Delete target if it exists from a previous failed run
             try:
                 api.repo_info(repo_id, repo_type="model")
                 print(f"  Deleting stale repo {repo_id} from previous run...")
                 api.delete_repo(repo_id, repo_type="model")
                 time.sleep(0.5)
             except Exception:
-                pass  # Repo doesn't exist, good
+                pass
 
-            # Duplicate parent repo server-side (all branches + LFS, no local downloads)
-            print(f"  Duplicating {parent_repo} → {repo_id}")
+            # c. Duplicate parent (main now has this BPW's files) → new repo
+            print(f"  Duplicating parent → {repo_id}")
             api.duplicate_repo(
                 from_id=parent_repo,
                 to_id=repo_id,
@@ -377,19 +323,11 @@ def main():
             )
             time.sleep(0.5)
 
-            # Wait for async duplication to finish
-            wait_for_branch(api, repo_id, branch)
-
-            # Push the correct branch as main (same repo, no LFS download)
-            push_branch_to_main(
-                repo_id=repo_id,
-                branch=branch,
-                readme_text=readme_text,
-                token=token,
-            )
+            # d. Restore parent's main from backup
+            restore_main_from_backup(api, parent_repo, backup_branch)
             time.sleep(0.5)
 
-            # Delete all BPW branches from the duplicate
+            # e. Delete BPW branches from the new repo (it inherited them)
             for other_bpw in bpws:
                 other_branch = f"{fmt_bpw(other_bpw)}bpw"
                 try:
@@ -397,8 +335,20 @@ def main():
                     time.sleep(0.5)
                 except Exception:
                     pass
+            # Also delete the backup branch from the duplicate
+            try:
+                api.delete_branch(repo_id, branch=backup_branch, repo_type="model")
+            except Exception:
+                pass
 
             print(f"  ✓ {repo_id}")
+
+        # Clean up backup branch from parent
+        try:
+            api.delete_branch(parent_repo, branch=backup_branch, repo_type="model")
+            print(f"\n  Deleted backup branch from parent.")
+        except Exception:
+            pass
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
@@ -406,16 +356,11 @@ def main():
     print(f"{'=' * 60}\n")
 
     if args.dry_run:
-        print(f"  [DRY RUN] Would merge {largest_branch} → main on {parent_repo}")
+        print(f"  [DRY RUN] Would copy {largest_branch} → main on {parent_repo}")
         print(f"  [DRY RUN] Would rename {parent_repo} → {largest_repo}")
     else:
-        print(f"  Merging {largest_branch} → main on {parent_repo}")
-        merge_branch_to_main(
-            repo_id=parent_repo,
-            branch=largest_branch,
-            readme_text=readme_text,
-            token=token,
-        )
+        print(f"  Copying {largest_branch} → main on {parent_repo} (via API)")
+        copy_branch_to_main(api, parent_repo, largest_branch, readme_text)
         time.sleep(0.5)
 
         print(f"\n  Renaming {parent_repo} → {largest_repo}")
@@ -452,7 +397,7 @@ def main():
             print("  Please verify manually, then delete branches with:")
             for bpw in bpws:
                 branch = f"{fmt_bpw(bpw)}bpw"
-                print(f"    huggingface_hub.HfApi().delete_branch('{largest_repo}', branch='{branch}')")
+                print(f"    api.delete_branch('{largest_repo}', branch='{branch}')")
             sys.exit(1)
 
     # ── 5. Delete old branches ───────────────────────────────────────────
