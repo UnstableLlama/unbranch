@@ -321,12 +321,17 @@ def main():
 
             print(f"  ✓ {repo_id}")
 
-        # Clean up backup branch from parent
+        # Rename backup branch to main_original (preserves original main content)
         try:
+            api.create_branch(
+                parent_repo, branch="main_original",
+                repo_type="model", revision=backup_branch,
+            )
             api.delete_branch(parent_repo, branch=backup_branch, repo_type="model")
-            print(f"\n  Deleted backup branch from parent.")
-        except Exception:
-            pass
+            print(f"\n  Preserved original main as branch 'main_original'")
+        except Exception as e:
+            print(f"\n  Could not rename backup branch: {e}")
+            print(f"  Original main is still on branch '{backup_branch}'")
 
     # ── 3. Handle parent repo → largest BPW ──────────────────────────────
     print(f"\n{'=' * 60}")
