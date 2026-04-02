@@ -46,13 +46,26 @@ def fmt_bpw(bpw: float) -> str:
     return f"{bpw:.2f}"
 
 
-def run_git(args: list[str], cwd: str | None = None, env: dict | None = None):
-    """Run a git command, printing it and raising on failure."""
+def run_git(args: list[str], cwd: str | None = None, env: dict | None = None,
+            stream: bool = False):
+    """Run a git command, printing it and raising on failure.
+
+    If stream=True, stdout/stderr are printed in real-time (for long-running
+    commands like git lfs fetch/push). Otherwise output is captured and
+    summarized after completion.
+    """
     merged_env = {**os.environ, **(env or {})}
     display = " ".join(args)
     # Redact tokens from display
     display = re.sub(r"(https?://)[^@]+@", r"\1***@", display)
     print(f"  $ {display}")
+
+    if stream:
+        result = subprocess.run(args, cwd=cwd, env=merged_env)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, args)
+        return result
+
     result = subprocess.run(
         args, cwd=cwd, env=merged_env, capture_output=True, text=True
     )
@@ -215,7 +228,7 @@ def transfer_branch_to_new_repo(*, source_repo, branch, target_repo, readme_text
 
         # Fetch LFS objects from source into the local cache
         print("    Fetching LFS objects from source...")
-        run_git(["git", "lfs", "fetch", "origin", "--all"], cwd=tmpdir)
+        run_git(["git", "lfs", "fetch", "origin", "--all"], cwd=tmpdir, stream=True)
 
         # Swap remote to the target repo
         run_git(
@@ -225,7 +238,7 @@ def transfer_branch_to_new_repo(*, source_repo, branch, target_repo, readme_text
 
         # Push LFS objects to the new repo, then push git history
         print("    Pushing LFS objects to target...")
-        run_git(["git", "lfs", "push", "origin", "--all"], cwd=tmpdir)
+        run_git(["git", "lfs", "push", "origin", "--all"], cwd=tmpdir, stream=True)
         run_git(
             ["git", "push", "-u", "origin", "main", "--force"],
             cwd=tmpdir, env=lfs_env,
