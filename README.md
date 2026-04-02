@@ -3,7 +3,7 @@
 Split a HuggingFace repo that stores quantized models on separate branches (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos.
 
 > [!CAUTION]
-> **This script performs destructive, irreversible operations.** It renames your parent repo, force-pushes branches to main, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
+> **This script performs destructive, irreversible operations.** It overwrites the parent repo's main branch, renames the parent repo, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
 
 ## Why
 
@@ -30,13 +30,16 @@ The largest BPW gets the renamed parent repo, preserving download counts and sta
 
 ## How it works
 
+Pure HuggingFace API — no git, no model file downloads. The only file that touches your disk is the README.
+
 1. Downloads the README and rewrites branch links to point at the new single-BPW repos.
-2. For each BPW except the largest: creates a new repo and pushes the branch content as `main`.
-3. For the largest BPW: force-pushes that branch to `main` on the parent repo, then renames it.
+2. For each BPW except the largest:
+   - `CommitOperationCopy`: server-side copy of branch files → parent's main
+   - `duplicate_repo`: snapshot parent's main → new single-BPW repo
+   - Restore parent's main from a backup branch
+3. For the largest BPW: copy branch → parent's main, rename the parent repo.
 4. Verifies all repos have files.
 5. Deletes the old BPW branches from the renamed parent.
-
-No large files are downloaded. Branches are cloned with `GIT_LFS_SKIP_SMUDGE=1` (only LFS pointers touch disk). HuggingFace's server resolves the pointers since the LFS objects already exist in its storage.
 
 ## Requirements
 

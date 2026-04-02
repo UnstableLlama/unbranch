@@ -139,28 +139,6 @@ def copy_branch_to_main(api, repo_id: str, branch: str, readme_text: str):
     )
 
 
-def restore_main(api, repo_id: str, original_main_files: list, original_readme: str):
-    """Restore parent's main branch to its original state."""
-    print(f"    Restoring parent main...")
-
-    current_files = list_main_files(api, repo_id)
-    original_filenames = {f.rfilename for f in original_main_files}
-
-    operations = []
-
-    # Copy back original files from... wait, we need the original commit.
-    # Simpler: we saved the original main file list. We can use
-    # CommitOperationCopy with src_revision pointing to the commit before
-    # our changes. But we don't have that easily.
-    #
-    # Better approach: just delete everything and re-copy from the original
-    # main state. But we need a reference to it.
-    #
-    # Simplest: before we modify main, we create a backup branch.
-    # Then restore from the backup branch.
-    raise NotImplementedError("Use save/restore pattern instead")
-
-
 def save_main_as_backup(api, repo_id: str):
     """Create a backup branch of main before we start modifying it."""
     backup_branch = "_unbranch_backup_main"
