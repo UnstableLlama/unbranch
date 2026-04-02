@@ -357,13 +357,22 @@ def main():
             repo_id = target_id(bpw)
             print(f"\n  ── {repo_id} (from branch {branch}) ──")
 
+            # Delete target if it exists from a previous failed run
+            # (duplicate_repo with exist_ok silently skips, leaving stale repos)
+            try:
+                api.repo_info(repo_id, repo_type="model")
+                print(f"  Deleting stale repo {repo_id} from previous run...")
+                api.delete_repo(repo_id, repo_type="model")
+                time.sleep(0.5)
+            except Exception:
+                pass  # Repo doesn't exist, good
+
             # Duplicate parent repo server-side (all branches + LFS, no local downloads)
             print(f"  Duplicating {parent_repo} → {repo_id}")
             api.duplicate_repo(
                 from_id=parent_repo,
                 to_id=repo_id,
                 private=args.private,
-                exist_ok=True,
                 repo_type="model",
             )
             time.sleep(0.5)
