@@ -169,25 +169,30 @@ def _clone_branch_and_update_readme(*, hf_url, repo_id, branch, readme_text, tmp
     run_git(["git", "branch", "-M", "main"], cwd=tmpdir)
 
 
-def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 120):
+def wait_for_branch(api, repo_id: str, branch: str, timeout: int = 600):
     """Poll until a branch exists on a HuggingFace repo.
 
-    duplicate_repo() is async on HF's side — branches may not be available
-    immediately after the call returns.
+    duplicate_repo() is async on HF's side — for large repos with many GB
+    of LFS data, the server-side copy can take several minutes.
     """
-    deadline = time.time() + timeout
+    start = time.time()
+    deadline = start + timeout
     while time.time() < deadline:
         try:
             refs = api.list_repo_refs(repo_id, repo_type="model")
             branch_names = [b.name for b in refs.branches]
             if branch in branch_names:
+                elapsed = int(time.time() - start)
+                print(f"    Branch {branch} ready ({elapsed}s)")
                 return
         except Exception:
             pass
-        print(f"    Waiting for branch {branch} on {repo_id}...")
-        time.sleep(2)
+        elapsed = int(time.time() - start)
+        print(f"    Waiting for HF server-side duplication... ({elapsed}s / {timeout}s)")
+        time.sleep(5)
     raise TimeoutError(
-        f"Branch {branch} did not appear on {repo_id} within {timeout}s"
+        f"Branch {branch} did not appear on {repo_id} within {timeout}s. "
+        f"The repo may still be duplicating — check https://huggingface.co/{repo_id} manually."
     )
 
 
