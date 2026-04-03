@@ -65,8 +65,8 @@ python unbranch.py \
   --author UnstableLlama \
   --repo-name Qwen3.5-4B-exl3 \
   --bpws 2.10 3.00 4.00 5.00 6.00 \
-  --dry-run
- # --private \
+  --dry-run \
+ # --private
 
 ```
 
