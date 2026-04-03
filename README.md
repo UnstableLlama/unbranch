@@ -2,6 +2,8 @@
 
 Instantly split a branched HuggingFace repo of quantized models (e.g. `2.10bpw`, `3.00bpw`, `6.00bpw`) into individual single-BPW repos while retaining likes and downloads.
 
+This repo isn't meant to be plug-and-play, as it is unlikely that we used the same naming conventions for our repos. But it's easy to copy one of your readmes and the script into an LLM and customize for your self. Test first, start small, go slow.
+
 > [!CAUTION]
 > **This script performs destructive, irreversible operations.** It overwrites the parent repo's main branch, renames the parent repo, and deletes branches. There is no undo. Always do a `--dry-run` first (or use the Jupyter notebook with `DRY_RUN = True`) to preview what will happen before committing to a real run.
 

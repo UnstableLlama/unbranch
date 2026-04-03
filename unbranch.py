@@ -338,14 +338,16 @@ def main():
             copy_branch_to_main(api, parent_repo, branch, readme_text)
             time.sleep(0.5)
 
-            # b. Delete target if it exists from a previous failed run
+            # b. Check target doesn't already exist
             try:
                 api.repo_info(repo_id, repo_type="model")
-                print(f"  Deleting stale repo {repo_id} from previous run...")
-                api.delete_repo(repo_id, repo_type="model")
-                time.sleep(0.5)
+                print(f"\n  ERROR: {repo_id} already exists!")
+                print(f"  If it's leftover from a failed run, delete it manually:")
+                print(f"    https://huggingface.co/{repo_id}/settings")
+                print(f"  Then re-run this script.")
+                sys.exit(1)
             except Exception:
-                pass
+                pass  # Repo doesn't exist — good
 
             # c. Duplicate parent (main now has this BPW's files) → new repo
             print(f"  Duplicating parent → {repo_id}")
