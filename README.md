@@ -22,11 +22,11 @@ BEFORE (branched):
     └── branch: 6.00bpw
 
 AFTER (unbranched):
-  UnstableLlama/Qwen3.5-4B-2.10bpw-exl3  (new repo)
-  UnstableLlama/Qwen3.5-4B-3.00bpw-exl3  (new repo)
-  UnstableLlama/Qwen3.5-4B-4.00bpw-exl3  (new repo)
-  UnstableLlama/Qwen3.5-4B-5.00bpw-exl3  (new repo)
-  UnstableLlama/Qwen3.5-4B-6.00bpw-exl3  (renamed parent)
+  UnstableLlama/Qwen3.5-4B-exl3-2.10bpw  (new repo)
+  UnstableLlama/Qwen3.5-4B-exl3-3.00bpw  (new repo)
+  UnstableLlama/Qwen3.5-4B-exl3-4.00bpw  (new repo)
+  UnstableLlama/Qwen3.5-4B-exl3-5.00bpw  (new repo)
+  UnstableLlama/Qwen3.5-4B-exl3-6.00bpw  (renamed parent)
 ```
 
 The largest BPW gets the renamed parent repo, preserving download counts and stars. The original main branch content is saved as a `main_original` branch on that repo, so nothing is lost.
@@ -81,16 +81,6 @@ Remove `--dry-run` when you're ready to execute for real.
 
 Open `unbranch.ipynb` and fill in the config cell. Same workflow, interactive output. The notebook runs each step in its own cell so you can inspect results before proceeding, and defaults to `DRY_RUN = True`.
 
-## Supported quant formats
+## Naming
 
-The BPW is inserted before the quant suffix in the repo name. Recognized suffixes:
-
-| Suffix | Format |
-|--------|--------|
-| `-exl3` | ExLlamaV3 |
-| `-exl2` | ExLlamaV2 |
-| `-gguf` | GGUF |
-| `-gptq` | GPTQ |
-| `-awq` | AWQ |
-
-For unrecognized suffixes, the BPW is appended at the end.
+The BPW is appended to the repo name: `Qwen3.5-4B-exl3` → `Qwen3.5-4B-exl3-4.00bpw`.

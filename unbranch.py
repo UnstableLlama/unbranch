@@ -49,14 +49,10 @@ def fmt_bpw(bpw: float) -> str:
 
 
 def make_target_name(repo_name: str, bpw: float) -> str:
-    """Build the single-BPW repo name by inserting the BPW before the quant suffix.
+    """Build the single-BPW repo name by appending the BPW.
 
-    Example: Qwen3.5-4B-exl3  +  4.00  →  Qwen3.5-4B-4.00bpw-exl3
+    Example: Qwen3.5-4B-exl3  +  4.00  →  Qwen3.5-4B-exl3-4.00bpw
     """
-    for suffix in ("-exl3", "-exl2", "-gguf", "-gptq", "-awq"):
-        if repo_name.endswith(suffix):
-            base = repo_name[: -len(suffix)]
-            return f"{base}-{fmt_bpw(bpw)}bpw{suffix}"
     return f"{repo_name}-{fmt_bpw(bpw)}bpw"
 
 
@@ -72,13 +68,6 @@ def rewrite_readme(readme: str, author: str, repo_name: str, bpws: list[float]) 
         readme = readme.replace(f"{parent}/tree/{branch}", target)
         readme = readme.replace(f'{parent} --revision "{branch}"', target)
         readme = readme.replace(f"{parent} --revision {branch}", target)
-
-    for bpw in bpws:
-        b = fmt_bpw(bpw)
-        old_dir = f"{repo_name}-{b}bpw"
-        new_dir = make_target_name(repo_name, bpw)
-        if old_dir != new_dir:
-            readme = readme.replace(f"--local-dir ./{old_dir}", f"--local-dir ./{new_dir}")
 
     return readme
 
