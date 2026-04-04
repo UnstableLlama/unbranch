@@ -18,9 +18,10 @@ How it works (no git, no model file downloads — pure HF API):
     1. Downloads ONLY the README and rewrites branch links.
     2. For each smaller BPW:
        a. CommitOperationCopy: copy branch files → parent's main
-       b. duplicate_repo: snapshot parent's main → new single-BPW repo
-       c. Restore parent's main to its original state
-    3. For the largest BPW: copy branch → parent's main, rename parent.
+       b. Add shared files from original main → parent's main
+       c. duplicate_repo: snapshot parent's main → new single-BPW repo
+       d. Restore parent's main to its original state
+    3. For the largest BPW: copy branch → parent's main, add shared files, rename parent.
     4. Verify all repos have files.
     5. Delete old branches from the renamed parent.
 
@@ -179,60 +180,37 @@ def restore_main_from_backup(api, repo_id: str, backup_branch: str):
     print(f"    Main restored.")
 
 
-def merge_original_main_files(api, repo_id: str, original_branch: str = "main_original"):
-    """Copy non-conflicting files from main_original into main.
+def add_shared_files_to_main(api, repo_id: str, source_branch: str):
+    """Copy files from source_branch into main that don't already exist.
 
-    Files that already exist on main are skipped (no overwrites).
-    Returns True if all files were copied (or there were none to copy),
-    False if any files were skipped due to conflicts.
+    This merges the original main's shared files (e.g. config.json, tokenizer)
+    into main after a BPW branch has been copied there, so the duplicate will
+    contain everything.
     """
-    try:
-        orig_files = list_branch_files(api, repo_id, original_branch)
-    except Exception:
-        print(f"    No {original_branch} branch found on {repo_id}, skipping.")
-        return True
-
+    source_files = list_branch_files(api, repo_id, source_branch)
     main_files = list_main_files(api, repo_id)
     main_filenames = {f.rfilename for f in main_files}
 
     operations = []
-    skipped = []
-
-    for f in orig_files:
-        if f.rfilename in main_filenames:
-            skipped.append(f.rfilename)
-        else:
+    for f in source_files:
+        if f.rfilename not in main_filenames:
             operations.append(CommitOperationCopy(
                 src_path_in_repo=f.rfilename,
                 path_in_repo=f.rfilename,
-                src_revision=original_branch,
+                src_revision=source_branch,
             ))
 
     if operations:
-        print(f"    Copying {len(operations)} file(s) from {original_branch}...")
+        print(f"    Adding {len(operations)} shared file(s) from original main...")
         api.create_commit(
             repo_id=repo_id,
             repo_type="model",
             operations=operations,
-            commit_message=f"Add shared files from original main branch",
+            commit_message="Add shared files from original main",
             revision="main",
         )
     else:
-        print(f"    No new files to copy from {original_branch}.")
-
-    if skipped:
-        print(f"    Skipped {len(skipped)} file(s) (already exist on main):")
-        for name in skipped:
-            print(f"      - {name}")
-        return False
-
-    # All files copied (or none to copy) — safe to delete the branch
-    try:
-        api.delete_branch(repo_id, branch=original_branch, repo_type="model")
-        print(f"    Deleted {original_branch} branch (all files merged).")
-    except Exception:
-        pass
-    return True
+        print(f"    No additional shared files to add.")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -327,7 +305,11 @@ def main():
             copy_branch_to_main(api, parent_repo, branch, readme_text)
             time.sleep(0.5)
 
-            # b. Check target doesn't already exist
+            # b. Add shared files from original main (so the duplicate gets everything)
+            add_shared_files_to_main(api, parent_repo, backup_branch)
+            time.sleep(0.5)
+
+            # c. Check target doesn't already exist
             try:
                 api.repo_info(repo_id, repo_type="model")
                 print(f"\n  ERROR: {repo_id} already exists!")
@@ -338,7 +320,7 @@ def main():
             except Exception:
                 pass  # Repo doesn't exist — good
 
-            # c. Duplicate parent (main now has this BPW's files) → new repo
+            # d. Duplicate parent (main now has BPW files + shared files) → new repo
             print(f"  Duplicating parent → {repo_id}")
             api.duplicate_repo(
                 from_id=parent_repo,
@@ -348,11 +330,11 @@ def main():
             )
             time.sleep(0.5)
 
-            # d. Restore parent's main from backup
+            # e. Restore parent's main from backup
             restore_main_from_backup(api, parent_repo, backup_branch)
             time.sleep(0.5)
 
-            # e. Delete BPW branches from the new repo (it inherited them)
+            # f. Delete inherited branches from the new repo
             for other_bpw in bpws:
                 other_branch = f"{fmt_bpw(other_bpw)}bpw"
                 try:
@@ -360,19 +342,10 @@ def main():
                     time.sleep(0.5)
                 except Exception:
                     pass
-
-            # f. Rename backup branch to main_original, merge shared files into main
             try:
-                api.create_branch(
-                    repo_id, branch="main_original",
-                    repo_type="model", revision=backup_branch,
-                )
                 api.delete_branch(repo_id, branch=backup_branch, repo_type="model")
             except Exception:
                 pass
-            print(f"  Merging shared files from original main...")
-            merge_original_main_files(api, repo_id)
-            time.sleep(0.5)
 
             print(f"  ✓ {repo_id}")
 
@@ -401,9 +374,8 @@ def main():
         copy_branch_to_main(api, parent_repo, largest_branch, readme_text)
         time.sleep(0.5)
 
-        # Merge shared files from original main into the largest BPW
-        print(f"  Merging shared files from original main...")
-        merge_original_main_files(api, parent_repo)
+        # Add shared files from original main into the largest BPW
+        add_shared_files_to_main(api, parent_repo, "main_original")
         time.sleep(0.5)
 
         print(f"\n  Renaming {parent_repo} → {largest_repo}")
